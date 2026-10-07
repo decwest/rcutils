@@ -27,6 +27,7 @@
 #include "rcutils/time.h"
 #include "rcutils/types/char_array.h"
 #include "rcutils/types/rcutils_ret.h"
+#include "rcutils/types/string_array.h"
 #include "rcutils/visibility_control.h"
 
 #ifdef __cplusplus
@@ -175,6 +176,65 @@ rcutils_ret_t rcutils_logging_initialize(void);
 RCUTILS_PUBLIC
 RCUTILS_WARN_UNUSED
 rcutils_ret_t rcutils_logging_shutdown(void);
+
+/// Register a logger name in the current process.
+/**
+ * Registering a name does not change its severity level. Duplicate registrations
+ * succeed without adding another entry. An empty name denotes the default logger
+ * and is ignored. Names are copied and retained until rcutils_logging_shutdown(),
+ * independently of logger object lifetimes and ROS contexts.
+ *
+ * Registration and enumeration are mutually thread-safe. The logging system is
+ * initialized on first use, but concurrent initialization, shutdown, or other
+ * logging configuration operations must be synchronized by the caller.
+ *
+ * Attribute          | Adherence
+ * ------------------ | -------------
+ * Allocates Memory   | Yes, for new names
+ * Thread-Safe        | Yes, with registration and enumeration
+ * Uses Atomics       | No
+ * Lock-Free          | No
+ *
+ * \param[in] name Null-terminated logger name; must not be NULL.
+ * \return #RCUTILS_RET_OK on success, or an initialization/allocation error.
+ * \return #RCUTILS_RET_INVALID_ARGUMENT if name is NULL.
+ */
+RCUTILS_PUBLIC
+RCUTILS_WARN_UNUSED
+rcutils_ret_t rcutils_logging_register_logger(const char * name);
+
+/// Get a snapshot of registered logger names in the current process.
+/**
+ * NULL selects all names. A nonempty base selects its exact match and descendants
+ * separated by '.', e.g. "foo" selects "foo.bar" but not "foobar". This is a
+ * logger-name hierarchy filter, not an association between loggers and ROS nodes.
+ * Only registered names are returned; missing ancestors are not synthesized.
+ * Merely configuring a logger level or emitting a log does not register a name.
+ *
+ * Results are unique and lexicographically sorted. The output must be zero
+ * initialized. Its strings are independent copies allocated with allocator;
+ * release them with rcutils_string_array_fini(). On failure the output is unchanged.
+ * Thread-safety and initialization follow rcutils_logging_register_logger().
+ *
+ * Attribute          | Adherence
+ * ------------------ | -------------
+ * Allocates Memory   | Yes
+ * Thread-Safe        | Yes, with registration and enumeration
+ * Uses Atomics       | No
+ * Lock-Free          | No
+ *
+ * \param[in] base_logger_name NULL or a nonempty logger name.
+ * \param[in] allocator Allocator for the returned array and strings.
+ * \param[out] logger_names Zero-initialized output array.
+ * \return #RCUTILS_RET_OK on success, or an initialization/allocation error.
+ * \return #RCUTILS_RET_INVALID_ARGUMENT for invalid arguments.
+ */
+RCUTILS_PUBLIC
+RCUTILS_WARN_UNUSED
+rcutils_ret_t rcutils_logging_get_logger_names(
+  const char * base_logger_name,
+  rcutils_allocator_t allocator,
+  rcutils_string_array_t * logger_names);
 
 /// The structure identifying the caller location in the source code.
 typedef struct rcutils_log_location_s
