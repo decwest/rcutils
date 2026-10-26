@@ -34,6 +34,7 @@
 # include <windows.h>
 # pragma warning(pop)
 #else
+# include <pthread.h>
 # include <unistd.h>
 #endif
 
@@ -43,6 +44,7 @@
 #include "rcutils/find.h"
 #include "rcutils/format_string.h"
 #include "rcutils/logging.h"
+#include "rcutils/qsort.h"
 #include "rcutils/snprintf.h"
 #include "rcutils/strdup.h"
 #include "rcutils/strerror.h"
@@ -96,6 +98,36 @@ static rcutils_allocator_t g_rcutils_logging_allocator;
 
 static rcutils_logging_output_handler_t g_rcutils_logging_output_handler = NULL;
 static rcutils_hash_map_t g_rcutils_logging_severities_map;
+
+// A separate registry: setting a severity does not imply that a logger was created.
+static rcutils_hash_map_t g_rcutils_logging_logger_names;
+#ifdef _WIN32
+static SRWLOCK g_rcutils_logging_registry_mutex = SRWLOCK_INIT;
+#else
+static pthread_mutex_t g_rcutils_logging_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
+static rcutils_ret_t lock_logger_registry(void)
+{
+#ifdef _WIN32
+  AcquireSRWLockExclusive(&g_rcutils_logging_registry_mutex);
+#else
+  if (pthread_mutex_lock(&g_rcutils_logging_registry_mutex) != 0) {
+    RCUTILS_SET_ERROR_MSG("Failed to lock logger registry");
+    return RCUTILS_RET_ERROR;
+  }
+#endif
+  return RCUTILS_RET_OK;
+}
+
+static void unlock_logger_registry(void)
+{
+#ifdef _WIN32
+  ReleaseSRWLockExclusive(&g_rcutils_logging_registry_mutex);
+#else
+  (void)pthread_mutex_unlock(&g_rcutils_logging_registry_mutex);
+#endif
+}
 
 // If this is false, attempts to use the severities map will be skipped.
 // This can happen if allocation of the map fails at initialization.
@@ -829,13 +861,39 @@ rcutils_ret_t rcutils_logging_initialize_with_allocator(rcutils_allocator_t allo
   return RCUTILS_RET_OK;
 }
 
+static rcutils_ret_t clear_logger_registry(void)
+{
+  rcutils_ret_t ret = lock_logger_registry();
+  if (ret != RCUTILS_RET_OK) {
+    return ret;
+  }
+  if (g_rcutils_logging_logger_names.impl != NULL) {
+    char * name = NULL;
+    bool registered;
+    while ((ret = rcutils_hash_map_get_next_key_and_data(
+          &g_rcutils_logging_logger_names, NULL, &name, &registered)) == RCUTILS_RET_OK)
+    {
+      ret = rcutils_hash_map_unset(&g_rcutils_logging_logger_names, &name);
+      if (ret != RCUTILS_RET_OK) {
+        break;
+      }
+      g_rcutils_logging_allocator.deallocate(name, g_rcutils_logging_allocator.state);
+    }
+    if (ret == RCUTILS_RET_HASH_MAP_NO_MORE_ENTRIES) {
+      ret = rcutils_hash_map_fini(&g_rcutils_logging_logger_names);
+    }
+  }
+  unlock_logger_registry();
+  return ret;
+}
+
 rcutils_ret_t rcutils_logging_shutdown(void)
 {
   if (!g_rcutils_logging_initialized) {
     return RCUTILS_RET_OK;
   }
 
-  rcutils_ret_t ret = RCUTILS_RET_OK;
+  rcutils_ret_t ret = clear_logger_registry();
   if (g_rcutils_logging_severities_map_valid) {
     // Iterate over the map, getting every key so we can free it
     char * key = NULL;
@@ -874,6 +932,135 @@ rcutils_ret_t rcutils_logging_shutdown(void)
     SetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), g_original_console_mode);
   }
   #endif
+  return ret;
+}
+
+rcutils_ret_t rcutils_logging_register_logger(const char * name)
+{
+  RCUTILS_CHECK_ARGUMENT_FOR_NULL(name, RCUTILS_RET_INVALID_ARGUMENT);
+  if (name[0] == '\0') {
+    return RCUTILS_RET_OK;
+  }
+  rcutils_ret_t ret = lock_logger_registry();
+  if (ret != RCUTILS_RET_OK) {
+    return ret;
+  }
+  ret = rcutils_logging_initialize();
+  if (ret != RCUTILS_RET_OK) {
+    goto done;
+  }
+  if (g_rcutils_logging_logger_names.impl == NULL) {
+    ret = rcutils_hash_map_init(
+      &g_rcutils_logging_logger_names, 2, sizeof(char *), sizeof(bool),
+      rcutils_hash_map_string_hash_func, rcutils_hash_map_string_cmp_func,
+      &g_rcutils_logging_allocator);
+    if (ret != RCUTILS_RET_OK) {
+      goto done;
+    }
+  }
+  if (!rcutils_hash_map_key_exists(&g_rcutils_logging_logger_names, &name)) {
+    char * copy = rcutils_strdup(name, g_rcutils_logging_allocator);
+    if (copy == NULL) {
+      RCUTILS_SET_ERROR_MSG("Failed to allocate logger name");
+      ret = RCUTILS_RET_BAD_ALLOC;
+      goto done;
+    }
+    const bool registered = true;
+    ret = rcutils_hash_map_set(&g_rcutils_logging_logger_names, &copy, &registered);
+    if (ret != RCUTILS_RET_OK) {
+      g_rcutils_logging_allocator.deallocate(copy, g_rcutils_logging_allocator.state);
+    }
+  }
+done:
+  unlock_logger_registry();
+  return ret;
+}
+
+static bool logger_name_matches(const char * name, const char * base)
+{
+  if (base == NULL) {
+    return true;
+  }
+  const size_t length = strlen(base);
+  return strncmp(name, base, length) == 0 &&
+         (name[length] == '\0' || name[length] == RCUTILS_LOGGING_SEPARATOR_CHAR);
+}
+
+rcutils_ret_t rcutils_logging_get_logger_names(
+  const char * base_logger_name,
+  rcutils_allocator_t allocator,
+  rcutils_string_array_t * logger_names)
+{
+  RCUTILS_CHECK_ARGUMENT_FOR_NULL(logger_names, RCUTILS_RET_INVALID_ARGUMENT);
+  RCUTILS_CHECK_ALLOCATOR_WITH_MSG(
+    &allocator, "invalid allocator", return RCUTILS_RET_INVALID_ARGUMENT);
+  if ((base_logger_name != NULL && base_logger_name[0] == '\0') ||
+    logger_names->data != NULL || logger_names->size != 0)
+  {
+    RCUTILS_SET_ERROR_MSG("Expected a nonempty base name and a zero-initialized output array");
+    return RCUTILS_RET_INVALID_ARGUMENT;
+  }
+  rcutils_ret_t ret = lock_logger_registry();
+  if (ret != RCUTILS_RET_OK) {
+    return ret;
+  }
+  rcutils_string_array_t result = rcutils_get_zero_initialized_string_array();
+  result.allocator = allocator;
+  ret = rcutils_logging_initialize();
+  if (ret != RCUTILS_RET_OK) {
+    goto done;
+  }
+  if (g_rcutils_logging_logger_names.impl != NULL) {
+    char * name = NULL;
+    bool registered;
+    size_t count = 0;
+    ret = rcutils_hash_map_get_next_key_and_data(
+      &g_rcutils_logging_logger_names, NULL, &name, &registered);
+    while (ret == RCUTILS_RET_OK) {
+      if (logger_name_matches(name, base_logger_name)) {
+        ++count;
+      }
+      ret = rcutils_hash_map_get_next_key_and_data(
+        &g_rcutils_logging_logger_names, &name, &name, &registered);
+    }
+    if (ret != RCUTILS_RET_HASH_MAP_NO_MORE_ENTRIES) {
+      goto done;
+    }
+    ret = RCUTILS_RET_OK;
+    if (count > 0) {
+      ret = rcutils_string_array_init(&result, count, &allocator);
+      if (ret != RCUTILS_RET_OK) {
+        goto done;
+      }
+      size_t index = 0;
+      ret = rcutils_hash_map_get_next_key_and_data(
+        &g_rcutils_logging_logger_names, NULL, &name, &registered);
+      while (ret == RCUTILS_RET_OK) {
+        if (logger_name_matches(name, base_logger_name)) {
+          result.data[index] = rcutils_strdup(name, allocator);
+          if (result.data[index++] == NULL) {
+            RCUTILS_SET_ERROR_MSG("Failed to copy logger name");
+            ret = RCUTILS_RET_BAD_ALLOC;
+            break;
+          }
+        }
+        ret = rcutils_hash_map_get_next_key_and_data(
+          &g_rcutils_logging_logger_names, &name, &name, &registered);
+      }
+      if (ret == RCUTILS_RET_HASH_MAP_NO_MORE_ENTRIES) {
+        ret = rcutils_qsort(
+          result.data, result.size, sizeof(char *), rcutils_string_array_sort_compare);
+      }
+    }
+  }
+done:
+  unlock_logger_registry();
+  if (ret == RCUTILS_RET_OK) {
+    *logger_names = result;
+  } else {
+    rcutils_ret_t fini_ret = rcutils_string_array_fini(&result);
+    (void)fini_ret;
+  }
   return ret;
 }
 

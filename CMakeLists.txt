@@ -150,6 +150,13 @@ if(BUILD_TESTING)
     ament_cmake_ros_core::ament_ros_defaults
   )
 
+  ament_add_gtest(test_logging_registry test/test_logging_registry.cpp)
+  target_link_libraries(test_logging_registry
+    ${PROJECT_NAME}
+    Threads::Threads
+    ament_cmake_ros_core::ament_ros_defaults
+  )
+
   add_executable(test_logging_long_messages test/test_logging_long_messages.cpp)
   target_link_libraries(test_logging_long_messages
     ${PROJECT_NAME}
